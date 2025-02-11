@@ -1,7 +1,10 @@
 import 'dart:convert';
-
 import 'package:flutter/material.dart';
+import 'package:ollama_dart/ollama_dart.dart';
+import 'package:ollama_first_app/chat_message.dart';
 import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
+import 'package:ollama_first_app/constants.dart';
 
 class App extends StatefulWidget {
   const App({super.key});
@@ -11,55 +14,96 @@ class App extends StatefulWidget {
 }
 
 class _AppState extends State<App> {
-  final TextEditingController _controller = TextEditingController();
-  final List<Map<String, String>> _chatMessages = [];
+  final _controller = TextEditingController();
+  final List<ChatMessage> _messages = [];
   bool _isLoading = false;
+  String _selectedModel = defaultSelectedModel;
+  final List<String> _pendingBase64Images = [];
+  final List<Widget> _pendingImageWidgets = [];
 
-  Future<void> query(String prompt) async {
-    _isLoading = true;
-    setState(() {});
+  final client = OllamaClient(baseUrl: ollamaBaseUrl);
 
-    final message = {
-      "role": "user",
-      "content": prompt,
-    };
+  final List<Map<String, dynamic>> _models = availableModels;
 
-    _chatMessages.add(message);
+  Future<String?> networkImageToBase64(String imageUrl) async {
+    try {
+      final response = await http.get(Uri.parse(imageUrl));
+      if (response.statusCode == 200) {
+        return base64Encode(response.bodyBytes);
+      }
+    } catch (e) {
+      print('Error converting image to base64: $e');
+    }
+    return null;
+  }
 
-    final data = {
-      "model": "mistral-small",
-      "messages": _chatMessages,
-      "stream": false,
-    };
+  Future<String?> fileToBase64(XFile file) async {
+    final bytes = await file.readAsBytes();
+    return base64Encode(bytes);
+  }
+
+  Future<Image> base64ToImage(String base64Image) async {
+    final bytes = base64Decode(base64Image);
+    return Image.memory(bytes);
+  }
+
+  Future<void> _sendMessage(String text) async {
+    if (text.trim().isEmpty && _pendingBase64Images.isEmpty) return;
+
+    setState(() {
+      _messages.add(ChatMessage(text: text, isUser: true));
+      _isLoading = true;
+    });
+
+    final request = GenerateCompletionRequest(
+      model: _selectedModel,
+      prompt: text,
+      images: _pendingBase64Images,
+      stream: true,
+    );
 
     try {
-      final response = await http.post(
-        Uri.parse('http://localhost:11434/api/chat'),
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: jsonEncode(data),
-      );
-
-      if (response.statusCode == 200) {
-        final responseData = jsonDecode(response.body);
-        _chatMessages.add({
-          "role": "system",
-          "content": responseData['message']['content'],
+      String responseText = '';
+      await for (final chunk
+          in client.generateCompletionStream(request: request)) {
+        setState(() {
+          responseText += chunk.response ?? '';
+          if (_messages.last.isUser) {
+            _messages.add(ChatMessage(text: responseText, isUser: false));
+          } else {
+            _messages.last = ChatMessage(text: responseText, isUser: false);
+          }
         });
-
-        _controller.clear();
-        setState(() {});
-      } else {
-        _chatMessages.remove(message);
-        setState(() {});
       }
-    } catch (error) {
-      _chatMessages.remove(message);
-      setState(() {});
+    } catch (e) {
+      setState(() {
+        _messages.add(ChatMessage(text: 'Error: $e', isUser: false));
+      });
     } finally {
-      _isLoading = false;
-      setState(() {});
+      setState(() {
+        _isLoading = false;
+        _pendingBase64Images.clear();
+        _pendingImageWidgets.clear();
+      });
+    }
+
+    _controller.clear();
+  }
+
+  Future<void> _pickImage() async {
+    final ImagePicker picker = ImagePicker();
+    final XFile? image = await picker.pickImage(source: ImageSource.gallery);
+
+    if (image != null) {
+      final base64Image = await fileToBase64(image);
+      final imageWidget = await base64ToImage(base64Image!);
+
+      setState(() {
+        _pendingBase64Images.add(base64Image);
+        _pendingImageWidgets.add(imageWidget);
+        _messages.add(
+            ChatMessage(text: null, isUser: true, imageWidget: imageWidget));
+      });
     }
   }
 
@@ -67,42 +111,71 @@ class _AppState extends State<App> {
   Widget build(BuildContext context) {
     return MaterialApp(
       home: Scaffold(
-        body: Padding(
-          padding: const EdgeInsets.all(8.0),
-          child: Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                ListView.builder(
-                  shrinkWrap: true,
-                  itemCount: _chatMessages.length + (_isLoading ? 1 : 0),
-                  itemBuilder: (context, index) {
-                    if (index == _chatMessages.length && _isLoading) {
-                      return const Center(child: CircularProgressIndicator());
-                    }
-
-                    final message = _chatMessages[index];
-                    return ListTile(
-                      title: Text(message['content'] ?? ''),
-                      leading: message['role'] == 'user'
-                          ? const Icon(Icons.person)
-                          : const Icon(Icons.computer),
-                    );
-                  },
-                ),
-                TextField(
-                  controller: _controller,
-                  decoration: const InputDecoration(
-                    hintText: 'Enter your message',
-                  ),
-                  enabled: !_isLoading,
-                  onSubmitted: (value) {
-                    query(value);
-                  },
-                ),
-              ],
+        appBar: AppBar(
+          title: Text('Ollama Chat'),
+          actions: [
+            DropdownButton<String>(
+              value: _selectedModel,
+              onChanged: (String? newValue) {
+                if (newValue != null) {
+                  setState(() {
+                    _selectedModel = newValue;
+                  });
+                }
+              },
+              items: _models
+                  .map<DropdownMenuItem<String>>((Map<String, dynamic> value) {
+                return DropdownMenuItem<String>(
+                  value: value['name'],
+                  child: Text(value['name']),
+                );
+              }).toList(),
             ),
-          ),
+          ],
+        ),
+        body: Column(
+          children: [
+            Expanded(
+              child: ListView.builder(
+                padding: EdgeInsets.all(8.0),
+                itemCount: _messages.length,
+                itemBuilder: (context, index) {
+                  final message = _messages[index];
+                  return ChatBubble(message: message);
+                },
+              ),
+            ),
+            if (_isLoading) LinearProgressIndicator(),
+            Padding(
+              padding: EdgeInsets.symmetric(horizontal: 8.0),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _controller,
+                      maxLines: null,
+                      enabled: !_isLoading,
+                      onSubmitted: _sendMessage,
+                      decoration: InputDecoration(
+                        hintText: 'Enter your message',
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.send),
+                    onPressed: () => _sendMessage(_controller.text),
+                  ),
+                  if (_models.firstWhere((model) =>
+                      model['name'] == _selectedModel)['supportsImages'])
+                    IconButton(
+                      icon: Icon(Icons.image),
+                      onPressed: _pickImage,
+                    ),
+                ],
+              ),
+            ),
+            SizedBox(height: 10),
+          ],
         ),
       ),
     );
